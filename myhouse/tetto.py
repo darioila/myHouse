@@ -1445,6 +1445,9 @@ class TettoTool(Tool):
                    "tra due spigoli esterni, e almeno un lato deve avere la "
                    "falda"), 6000)
             return False
+        except ImportError:
+            viewport.flash_status(tr("Serve shapely: pip install shapely"), 6000)
+            return False
         self.points = pts
         self.lines = lines
         self.heights = {self._key(h): h[2] for h in hs}

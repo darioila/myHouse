@@ -22,6 +22,23 @@ def test_solver_gable_and_inside_corner():
         _tetto_auto.solve(L_SHAPE, set(range(6)), 1.0)         # nothing slopes
 
 
+def test_solver_gable_ends_that_share_a_corner():
+    from myhouse import _tetto_auto
+    square = [(0., 0.), (6., 0.), (6., 6.), (0., 6.)]
+    pts, lines, hs = _tetto_auto.solve(square, {0, 1}, 1.0)   # a cross gable
+    assert max(h[2] for h in hs) == pytest.approx(3.0)        # not a peak at the shared corner
+    assert {(round(x, 6), round(y, 6)) for x, y in pts} == {(0., 0.), (3., 0.), (6., 0.), (6., 3.), (6., 6.), (0., 6.)}
+    got = {frozenset(((round(a[0], 6), round(a[1], 6)), (round(b[0], 6), round(b[1], 6)))) for a, b in lines}
+    assert got == {frozenset((p, (3., 3.))) for p in ((3., 0.), (6., 3.), (6., 0.), (0., 6.))}   # two ridges, valley, hip
+    z = {(round(x, 6), round(y, 6)): h for x, y, h in hs}
+    assert z[(3., 0.)] == pytest.approx(3.) and z[(6., 3.)] == pytest.approx(3.) and z[(6., 0.)] == pytest.approx(0.)
+    for o in (square[::-1], [(x + 10.15, y * 1.5 - 3.3) for x, y in square]):   # either direction, any place
+        for g in ({0, 1}, {1, 2}, {3, 0}, {0, 1, 2}):
+            _tetto_auto.solve(o, g, 0.5)
+    pts, lines, hs = _tetto_auto.solve(square, {0, 1, 2}, 1.0)  # one slope left: a shed roof
+    assert lines == [] and max(h[2] for h in hs) == pytest.approx(6.0)
+
+
 def test_pitch_text_and_parse(myhouse):
     from myhouse import tetto
     assert tetto.parse_pitch("30°") == pytest.approx(30.)

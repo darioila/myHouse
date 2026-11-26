@@ -15,7 +15,8 @@ added wherever a ridge meets a gable end), the inner lines, and the height of
 every point above the eaves as (x, y, z).
 
 How: the outline shrinks inwards, every sloped edge at the same speed and the
-gable edges not at all (a straight skeleton). A corner of the shrinking
+gable edges not at all (a straight skeleton; gable ends that share a corner
+are worked out apart, see _solve_cross). A corner of the shrinking
 outline draws a hip or a valley as it moves; where an edge shrinks to nothing
 or a corner runs into an edge, the outline is cut up and each piece carries
 on. The height of a point is the distance the outline had shrunk when it got
@@ -219,6 +220,18 @@ def solve(outline, gables=(), slope=1.0):
     text. Raises RoofError when these edges do not make a roof."""
     pts = _dedupe(outline)
     n = len(pts)
+    if n >= 3:
+        ends = {int(i) % n for i in gables}
+        if (n - len(ends) >= 2
+                and any((i + 1) % n in ends for i in ends)):
+            return _solve_cross(pts, ends, slope)
+    return _solve(pts, gables, slope)
+
+
+def _solve(outline, gables=(), slope=1.0):
+    """The roof as one shrinking outline."""
+    pts = _dedupe(outline)
+    n = len(pts)
     if n < 3 or abs(_area(pts)) < 1e-6:
         raise RoofError("not an outline")
     gables = {int(i) % n for i in gables}
@@ -336,4 +349,205 @@ def solve(outline, gables=(), slope=1.0):
     used = {p for p in points} | {p for ln in lines for p in ln}
     heights = [(c[0], c[1], height[k] * slope)
                for k, c in enumerate(canon) if c in used]
+    return points, lines, heights
+
+
+# ---------------------------------------------------------------------------
+# Gable ends next to each other
+# ---------------------------------------------------------------------------
+# Two gable ends that share a corner leave the shrinking outline nothing to
+# close that corner with: it would stand still and the two planes left would
+# climb all the way up to it. What is built there is a cross gable: the roof
+# of each gable end on its own (the other ends sloping), one laid over the
+# other, the higher surface on top. Each gable end keeps its triangle, the
+# ridges meet inside and a valley runs down to the shared corner.
+
+def _fit_plane(pts3):
+    """(a, b, c) of z = a·x + b·y + c through the points, or None."""
+    best, plane = 1e-9, None
+    for i in range(len(pts3)):
+        for j in range(i + 1, len(pts3)):
+            for k in range(j + 1, len(pts3)):
+                a, b, c = pts3[i], pts3[j], pts3[k]
+                u = [b[m] - a[m] for m in range(3)]
+                v = [c[m] - a[m] for m in range(3)]
+                nz = u[0] * v[1] - u[1] * v[0]
+                if abs(nz) > best:
+                    best = abs(nz)
+                    pa = -(u[1] * v[2] - u[2] * v[1]) / nz
+                    pb = -(u[2] * v[0] - u[0] * v[2]) / nz
+                    plane = (pa, pb, a[2] - pa * a[0] - pb * a[1])
+    return plane
+
+
+def _same_plane(p, q) -> bool:
+    return (abs(p[0] - q[0]) + abs(p[1] - q[1]) < 1e-5
+            and abs(p[2] - q[2]) < 1e-4)
+
+
+def _polygons(geom):
+    if geom.is_empty:
+        return []
+    if geom.geom_type == "Polygon":
+        return [geom]
+    return [g for g in getattr(geom, "geoms", ()) if g.geom_type == "Polygon"]
+
+
+def _segments(geom):
+    if geom.geom_type in ("LineString", "LinearRing"):
+        c = list(geom.coords)
+        return list(zip(c, c[1:]))
+    return [s for g in getattr(geom, "geoms", ()) for s in _segments(g)]
+
+
+def _solve_cross(pts, gables, slope):
+    from shapely.geometry import LinearRing, LineString, Point, Polygon
+    from shapely.ops import polygonize, unary_union
+
+    n = len(pts)
+    # -- the roof of every gable end on its own, as (region, plane) ----------
+    roofs = []
+    for g in sorted(gables):
+        p, lines, hs = _solve(pts, {g}, 1.0)
+        faces = []
+        for region in polygonize(unary_union(
+                [LinearRing(p)] + [LineString(ln) for ln in lines])):
+            pts3 = []
+            for x, y in list(region.exterior.coords)[:-1]:
+                h = min(hs, key=lambda q: _dist(q, (x, y)))
+                if _dist(h, (x, y)) < 1e-4:
+                    pts3.append((x, y, h[2]))
+            plane = _fit_plane(pts3)
+            if plane is None:
+                raise RoofError("a roof plane cannot be worked out")
+            faces.append((region, plane))
+        roofs.append(faces)
+
+    def top(x, y):
+        """The plane on top at (x, y)."""
+        pt, best, bz = Point(x, y), None, -math.inf
+        for faces in roofs:
+            _r, pl = min(faces, key=lambda f: f[0].distance(pt))
+            z = pl[0] * x + pl[1] * y + pl[2]
+            if z > bz + 1e-7:
+                best, bz = pl, z
+        return best, bz
+
+    # -- lay them over each other: cut every piece where two planes cross ----
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    big = 4 * (max(xs) - min(xs) + max(ys) - min(ys)) + 10
+    cells = roofs[0]
+    for faces in roofs[1:]:
+        new = []
+        for pa_poly, pa in cells:
+            for pb_poly, pb in faces:
+                for piece in _polygons(pa_poly.intersection(pb_poly)):
+                    if piece.area < 1e-9:
+                        continue
+                    da, db, dc = pa[0] - pb[0], pa[1] - pb[1], pa[2] - pb[2]
+                    g2 = da * da + db * db
+                    if g2 < 1e-12:               # parallel: the higher one
+                        new.append((piece, pa if dc >= 0 else pb))
+                        continue
+                    gl = math.sqrt(g2)
+                    ox, oy = -dc * da / g2, -dc * db / g2
+                    ux, uy, vx, vy = -db / gl, da / gl, da / gl, db / gl
+                    half = Polygon([
+                        (ox - ux * big, oy - uy * big),
+                        (ox + ux * big, oy + uy * big),
+                        (ox + (ux + vx) * big, oy + (uy + vy) * big),
+                        (ox - (ux - vx) * big, oy - (uy - vy) * big)])
+                    new += [(q, pa) for q in _polygons(piece.intersection(half))
+                            if q.area >= 1e-9]
+                    new += [(q, pb) for q in _polygons(piece.difference(half))
+                            if q.area >= 1e-9]
+        cells = new
+
+    # -- a line wherever the plane on top changes ----------------------------
+    canon: list = []
+
+    def cid(p) -> int:
+        for k, c in enumerate(canon):
+            if _dist(c, p) < SNAP:
+                return k
+        canon.append((float(p[0]), float(p[1])))
+        return len(canon) - 1
+
+    outline_ids = [cid(p) for p in pts]
+    inside = Polygon(pts)
+    pairs = set()
+    for a, b in _segments(unary_union([c.exterior for c, _pl in cells])):
+        length = _dist(a, b)
+        if length < 1e-6:
+            continue
+        mx, my = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+        ox, oy = -(b[1] - a[1]) / length * 1e-4, (b[0] - a[0]) / length * 1e-4
+        sides = [(mx + ox, my + oy), (mx - ox, my - oy)]
+        if not all(inside.contains(Point(s)) for s in sides):
+            continue                             # the outline itself
+        if _same_plane(top(*sides[0])[0], top(*sides[1])[0]):
+            continue
+        i, j = cid(a), cid(b)
+        if i != j:
+            pairs.add((min(i, j), max(i, j)))
+
+    def edge_of(p):
+        for i in range(n):
+            if seg_dist(p, pts[i], pts[(i + 1) % n]) < SNAP * 2:
+                return i
+        return None
+
+    changed = True
+    while changed:                               # cut at the points on a line
+        changed = False
+        ends = {k for pr in pairs for k in pr}
+        for i, j in sorted(pairs):
+            for k in ends:
+                if k in (i, j) or seg_dist(canon[k], canon[i],
+                                           canon[j]) >= SNAP * 2:
+                    continue
+                pairs.discard((i, j))
+                pairs.add((min(i, k), max(i, k)))
+                pairs.add((min(k, j), max(k, j)))
+                changed = True
+                break
+            if changed:
+                break
+    changed = True
+    while changed:                               # join what runs straight on
+        changed = False
+        at: dict = {}
+        for pr in pairs:
+            for k in pr:
+                at.setdefault(k, []).append(pr)
+        for k, prs in at.items():
+            if len(prs) != 2 or edge_of(canon[k]) is not None:
+                continue
+            i = prs[0][0] if prs[0][1] == k else prs[0][1]
+            j = prs[1][0] if prs[1][1] == k else prs[1][1]
+            if i == j or seg_dist(canon[k], canon[i], canon[j]) >= SNAP * 2:
+                continue
+            pairs -= set(prs)
+            pairs.add((min(i, j), max(i, j)))
+            changed = True
+            break
+
+    lines, extra = [], {}                        # extra: edge -> ids on it
+    for i, j in sorted(pairs):
+        lines.append((canon[i], canon[j]))
+        for k in (i, j):
+            if k in outline_ids:
+                continue
+            e = edge_of(canon[k])
+            if e is not None:
+                extra.setdefault(e, set()).add(k)
+    points = []
+    for i in range(n):
+        points.append(canon[outline_ids[i]])
+        for k in sorted(extra.get(i, ()),
+                        key=lambda k: _dist(canon[k], pts[i])):
+            points.append(canon[k])
+    used = {p for p in points} | {p for ln in lines for p in ln}
+    heights = [(c[0], c[1], max(0.0, top(*c)[1]) * slope)
+               for c in canon if c in used]
     return points, lines, heights
